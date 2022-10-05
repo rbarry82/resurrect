@@ -2,15 +2,18 @@ import logging
 import os
 import signal
 from datetime import timedelta
+from multiprocessing import Process
+from pathlib import Path
 from subprocess import Popen
 from typing import Callable, Dict, Optional
-from ops.charm import CharmBase, Object, CharmEvents
-from ops.framework import StoredState, EventSource, EventBase
 
-logger = logging.getLogger('resurrect')
+from ops.charm import CharmBase, CharmEvents, Object
+from ops.framework import EventBase, EventSource, StoredState
 
-juju_dispatch_path = 'JUJU_DISPATCH_PATH'
-operator_dispatch = 'OPERATOR_DISPATCH'
+logger = logging.getLogger("resurrect")
+
+juju_dispatch_path = "JUJU_DISPATCH_PATH"
+operator_dispatch = "OPERATOR_DISPATCH"
 
 
 class NotStarted(RuntimeError):
@@ -22,52 +25,71 @@ class AlreadyPrimed(RuntimeError):
 
 
 class ResurrectEvent(EventBase):
+    """Sent when resurrection happens."""
+
     pass
 
 
 class ResurrectEvents(CharmEvents):
-    timeout = EventSource(ResurrectEvent)
+    """Resurrection events."""
+
+    trigger = EventSource(ResurrectEvent)
 
 
 class Resurrect(Object):
+    """A relatively trivial library to send async events back to charms."""
+
     on = ResurrectEvents()
     _stored = StoredState()
 
-    def __init__(self, parent: CharmBase,
-                 key='resurrect',
-                 oneshot: Optional[timedelta] = None,
-                 every: Optional[timedelta] = None,
-                 allow_empty_env: bool = False):
+    def __init__(
+        self,
+        parent: CharmBase,
+        key="resurrect",
+        oneshot: Optional[timedelta] = None,
+        every: Optional[timedelta] = None,
+        check_method: Optional[Callable] = None,
+        allow_empty_env: bool = False,
+    ):
         super().__init__(parent, key)
-        if not (oneshot or every) or (oneshot and every):
-            raise ValueError('provide exactly one of `oneshot` and `every`.')
+        if not check_method or not (oneshot or every) or (oneshot and every):
+            raise ValueError("provide one of `check_method`, oneshot`, or`every`.")
 
         self._charm = parent
         self._every = every
         self._oneshot = oneshot
+        self._check_method = check_method
         self._allow_empty_env = allow_empty_env
 
         self._stored.set_default(env={}, pid=None)
 
     def is_started(self):
+        """Check whether the runner has been started."""
         return self._stored.pid
 
-    def prime(self, override: Dict[str, str] = None, overwrite: bool = False,
-              use_os_env=True):
+    def prime(
+        self,
+        override: Optional[Dict[str, str]],
+        overwrite: bool = False,
+        use_os_env=True,
+    ):
         """Store the current environment for later usage.
 
         If you pass use_os_env, the basis env will be provided by os.environ;
         otherwise it will be empty.
         Any override you pass will update that basis.
         """
+        override = override or {}
         if pid := self.is_started():
             if self._every:
                 # probably unintentional
                 logger.warning(f"re-priming an already running command (pid={pid})!")
             else:
                 # possibly unintentional?
-                logger.debug(f"re-priming an already launched one-shot command (pid={pid});"
-                             f"this will only have effect if you restart it.")
+                logger.debug(
+                    f"re-priming an already launched one-shot command (pid={pid});"
+                    f"this will only have effect if you restart it."
+                )
 
         if self._stored.env and not overwrite:
             logger.warning(f"{self} is already primed. Overriding...")
@@ -76,41 +98,66 @@ class Resurrect(Object):
         new_env.update(override)
         self._stored.env = new_env
 
-    def start(self, env: Dict[str, str] = None) -> int:
+    def _proc_runner(
+        self, check_function: Callable, dispatch_path: str, env: Dict
+    ) -> None:
+        os.environ = env
+        check_function()
+        Path(dispatch_path).touch()
+
+    def start(self, env: Optional[Dict[str, str]]) -> int:
         """Launch the process.
 
         Returns the pid of the launched process.
         """
-        if self.is_started() and self._every:
+        if self.is_started() and (self._check_method or self._every):
             logger.warning(f"this Resurrect is already running! {self._stored.pid}")
 
-        if env is None:
-            logger.debug('using stored env')
+        if not env:
+            logger.debug("using stored env")
             env = self._stored.env
 
         if not env and not self._allow_empty_env:
-            logger.warning('launching resurrect process with empty env. If this '
-                           'is calling `dispatch`, there will most definitely be errors.')
+            logger.warning(
+                "launching resurrect process with empty env. If this "
+                "is calling `dispatch`, there will most definitely be errors."
+            )
 
-        logger.info(f"overriding {env.get(juju_dispatch_path)} with hooks/resurrect")
-        env[juju_dispatch_path] = 'hooks/resurrect'
+        logger.info(
+            f"overriding {env.get(juju_dispatch_path, '')} with hooks/resurrect"
+        )
+        env[juju_dispatch_path] = "hooks/resurrect"
 
         # we need to set this key in order to tell the agent
         # that the charm is executing itself; otherwise it will look for
         # an event registered **on the charm**!.
-        env[f'{operator_dispatch}'] = '1'
+        env[f"{operator_dispatch}"] = "1"
 
         execute_charm = f"{os.getenv('JUJU_CHARM_DIR')}/dispatch"
 
-        if self._every:
-            resurrect_command = f"watch -n {self._every.seconds} {execute_charm!r}".split()
-        elif self._oneshot:
-            # if oneshot, we're running in shell mode, and we don't need to split the args.
-            resurrect_command = f"sleep {self._oneshot.seconds}; {execute_charm}"
+        if self._check_method:
+            proc = Process(
+                target=self._proc_runner,
+                kwargs={
+                    "check_function": self._check_method,
+                    "dispatch_path": execute_charm,
+                    "env": env,
+                },
+            )
+            proc.start()
+        elif self._every or self._oneshot:
+            if self._every:
+                resurrect_command = (
+                    f"watch -n {self._every.seconds} {execute_charm!r}".split()
+                )
+            elif self._oneshot:
+                # if oneshot, we're running in shell mode, and we don't need to split the args.
+                resurrect_command = f"sleep {self._oneshot.seconds}; {execute_charm}"
+            proc = Popen(resurrect_command, env=env, shell=bool(self._oneshot))
         else:
-            raise RuntimeError('Either _every or _oneshot need to be set.')
-
-        proc = Popen(resurrect_command, env=env, shell=bool(self._oneshot))
+            raise RuntimeError(
+                "One of _check_methid, _every, or _oneshot need to be set."
+            )
 
         logger.info(f"Resurrect process running on pid={proc.pid}")
         self._stored.pid = proc.pid
